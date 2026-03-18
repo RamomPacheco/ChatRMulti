@@ -1,0 +1,120 @@
+############################
+# Sensíveis / Secrets
+############################
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.p7b
+*.p7c
+*.kdbx
+*.sqlite
+*.db
+secrets.*
+credentials.*
+*api_key*
+*apikey*
+*token*
+*.log
+
+############################
+# Python
+############################
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.dll
+
+############################
+# Ambientes virtuais
+############################
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+
+############################
+# Build / distribuição
+############################
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+wheelhouse/
+
+############################
+# Test / cobertura
+############################
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+############################
+# Ferramentas / IDE
+############################
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+############################
+# Jupyter
+############################
+.ipynb_checkpoints/
+
+############################
+# RAG / Vector store / cache
+############################
+.chroma/
+chroma/
+*.parquet
+
+############################
+# Modelos locais (evitar commitar pesos)
+############################
+**/*.safetensors
+**/*.bin
+**/*.gguf
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.ckpt
+**/*.model
+**/*.tflite
+
+# Cache Hugging Face (normalmente muito grande)
+.huggingface/
+hf_cache/
+cache/
+**/models--*/
+**/datasets--*/
+**/spaces--*/
+**/hub/
+
+############################
+# Logs e saídas
+############################
+logs/
+*.out
+*.err
+
+############################
+# Exportações geradas
+############################
+resposta*.pdf
+resposta*.txt
+outputs/
+exports
+docs/

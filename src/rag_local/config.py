@@ -1,0 +1,73 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+from dotenv import load_dotenv
+import os
+
+
+@dataclass(frozen=True)
+class Settings:
+    rag_provider: str
+
+    ollama_model: str
+    ollama_base_url: str
+
+    hf_model: str
+    hf_device: int
+    hf_max_new_tokens: int
+    hf_cache_dir: Path
+
+    gguf_model_path: str
+    gguf_n_ctx: int
+    gguf_n_gpu_layers: int
+
+    embed_model: str
+
+    docs_dir: Path
+    chroma_dir: Path
+
+    chunk_size: int
+    chunk_overlap: int
+    top_k: int
+
+
+def _get_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ValueError(f"Variável {name} deve ser int (recebido: {raw!r})") from e
+
+
+def _get_str(name: str, default: str) -> str:
+    raw = os.getenv(name, "").strip()
+    return raw if raw else default
+
+
+def get_settings() -> Settings:
+    load_dotenv(override=False)
+
+    docs_dir = Path(_get_str("DOCS_DIR", "docs"))
+    chroma_dir = Path(_get_str("CHROMA_DIR", ".chroma"))
+    hf_cache_dir = Path(_get_str("HF_CACHE_DIR", r"E:\ComfyUI\models\LLM"))
+
+    return Settings(
+        rag_provider=_get_str("RAG_PROVIDER", "ollama").lower(),
+        ollama_model=_get_str("OLLAMA_MODEL", "llama3.1"),
+        ollama_base_url=_get_str("OLLAMA_BASE_URL", "http://localhost:11434"),
+        hf_model=_get_str("HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"),
+        hf_device=_get_int("HF_DEVICE", -1),
+        hf_max_new_tokens=_get_int("HF_MAX_NEW_TOKENS", 512),
+        hf_cache_dir=hf_cache_dir,
+        gguf_model_path=_get_str("GGUF_MODEL_PATH", ""),
+        gguf_n_ctx=_get_int("GGUF_N_CTX", 4096),
+        gguf_n_gpu_layers=_get_int("GGUF_N_GPU_LAYERS", 0),
+        embed_model=_get_str("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+        docs_dir=docs_dir,
+        chroma_dir=chroma_dir,
+        chunk_size=_get_int("CHUNK_SIZE", 1000),
+        chunk_overlap=_get_int("CHUNK_OVERLAP", 150),
+        top_k=_get_int("TOP_K", 4),
+    )
