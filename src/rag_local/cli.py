@@ -1,17 +1,27 @@
 from __future__ import annotations
+import logging
+import os
 from pathlib import Path
 from typing import Optional
+
 import typer
 from rich.console import Console
 from rich.panel import Panel
 from rag_local.config import get_settings
-from rag_local.llm import build_llm, list_ollama_models
+from rag_local.llm import (
+    build_llm,
+    list_google_models,
+    list_mistral_models,
+    list_ollama_models,
+    list_openai_models,
+)
 from rag_local.loaders import load_documents
 from rag_local.rag import answer, answer_with_sources, index_documents
 
 
 app = typer.Typer(add_completion=False, help="RAG local (Ollama/HF) com LangChain.")
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 @app.command()
@@ -19,20 +29,24 @@ def ingest(
     docs_dir: Optional[Path] = typer.Option(
         None, "--docs", "-d", help="Pasta com .pdf/.txt/.md para indexar."
     ),
-    reset: bool = typer.Option(
-        False, "--reset", help="Apaga o índice local (.chroma) antes de indexar."
+    append: bool = typer.Option(
+        False,
+        "--append",
+        "--keep-index",
+        help="Não apagar o índice (.chroma) antes; acrescenta ao existente.",
     ),
 ):
     """
-    Indexa documentos no Chroma (persistente).
+    Indexa documentos no Chroma.
+
+    Por padrão remove o índice vetorial anterior antes de nova indexação.
     """
+    logging.basicConfig(level=(logging.DEBUG if __import__("os").getenv("RAG_DEBUG") else logging.INFO))
+
     settings = get_settings()
     effective_docs_dir = docs_dir or settings.docs_dir
 
-    if reset and settings.chroma_dir.exists():
-        import shutil
-
-        shutil.rmtree(settings.chroma_dir)
+    clear_before = not append
 
     console.print(
         Panel.fit(
@@ -40,7 +54,9 @@ def ingest(
             f"- provider: [bold]{settings.rag_provider}[/bold]\n"
             f"- docs_dir: [bold]{effective_docs_dir}[/bold]\n"
             f"- chroma_dir: [bold]{settings.chroma_dir}[/bold]\n"
+            f"- embed_provider: [bold]{settings.embed_provider}[/bold]\n"
             f"- embed_model: [bold]{settings.embed_model}[/bold]\n"
+            f"- limpar_antes: [bold]{clear_before}[/bold]\n"
         )
     )
 
@@ -53,7 +69,12 @@ def ingest(
         console.print(Panel.fit(breakdown or "(vazio)", title="Docs carregados por arquivo"))
     except Exception:
         pass
-    n_docs, n_chunks = index_documents(settings, docs)
+    try:
+        n_docs, n_chunks = index_documents(settings, docs, clear_existing=clear_before)
+    except Exception as e:
+        logger.exception("Falha na indexação")
+        console.print(Panel(str(e), title="Erro na indexação", style="red"))
+        raise typer.Exit(code=1) from e
     console.print(f"[bold green]OK[/bold green] docs={n_docs} chunks={n_chunks}")
 
 
@@ -86,9 +107,10 @@ def ask(
         )
     )
 
+    extra = os.getenv("RAG_EXTRA_INSTRUCTIONS", "").strip()
     try:
         if sources:
-            res = answer_with_sources(settings, llm, question)
+            res = answer_with_sources(settings, llm, question, extra_instructions=extra)
             out = res.get("result") if isinstance(res, dict) else str(res)
             console.print(Panel(str(out), title="Resposta", expand=False))
 
@@ -104,7 +126,7 @@ def ask(
                     lines.append(f"{i}. source={src} page={page} :: {snippet}")
                 console.print(Panel("\n".join(lines), title="Sources (top hits)", expand=False))
         else:
-            out = answer(settings, llm, question)
+            out = answer(settings, llm, question, extra_instructions=extra)
             console.print(Panel(out, title="Resposta", expand=False))
     except Exception as e:
         msg = str(e)
@@ -136,6 +158,18 @@ def models():
         console.print(Panel("\n".join(ms) if ms else "(nenhum encontrado)", title="Ollama models"))
         return
 
+    if s.rag_provider == "api":
+        if s.api_provider == "openai":
+            ms = list_openai_models(s.openai_api_key)
+        elif s.api_provider == "mistral":
+            ms = list_mistral_models(s.mistral_api_key)
+        else:
+            ms = list_google_models(s.google_api_key)
+        console.print(
+            Panel("\n".join(ms) if ms else "(nenhum encontrado)", title=f"API models ({s.api_provider})")
+        )
+        return
+
     console.print(Panel(s.hf_model, title="HF model"))
 
 
@@ -155,6 +189,11 @@ def info():
                     f"hf_model={s.hf_model}",
                     f"hf_device={s.hf_device}",
                     f"hf_max_new_tokens={s.hf_max_new_tokens}",
+                    f"api_provider={s.api_provider}",
+                    f"openai_model={s.openai_model}",
+                    f"mistral_model={s.mistral_model}",
+                    f"google_model={s.google_model}",
+                    f"embed_provider={s.embed_provider}",
                     f"embed_model={s.embed_model}",
                     f"docs_dir={s.docs_dir}",
                     f"chroma_dir={s.chroma_dir}",

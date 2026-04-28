@@ -2,6 +2,88 @@ from __future__ import annotations
 from typing import Any
 from rag_local.config import Settings
 from pathlib import Path
+from langchain_core.language_models.llms import LLM
+
+
+class OpenAISdkLLM(LLM):
+    api_key: str
+    model: str
+
+    @property
+    def _llm_type(self) -> str:
+        return "openai-sdk"
+
+    def _call(self, prompt: str, stop: list[str] | None = None, run_manager=None, **kwargs: Any) -> str:
+        del stop, run_manager, kwargs
+        from openai import OpenAI
+
+        client = OpenAI(api_key=self.api_key)
+        res = client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        msg = (res.choices[0].message.content or "").strip() if getattr(res, "choices", None) else ""
+        return msg
+
+
+class MistralSdkLLM(LLM):
+    api_key: str
+    model: str
+
+    @property
+    def _llm_type(self) -> str:
+        return "mistral-sdk"
+
+    def _call(self, prompt: str, stop: list[str] | None = None, run_manager=None, **kwargs: Any) -> str:
+        del stop, run_manager, kwargs
+        from mistralai import Mistral
+
+        client = Mistral(api_key=self.api_key)
+        # SDK atual
+        if hasattr(client, "chat") and hasattr(client.chat, "complete"):
+            res = client.chat.complete(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            if getattr(res, "choices", None):
+                content = getattr(res.choices[0].message, "content", "")
+                return content.strip() if isinstance(content, str) else str(content).strip()
+        # Compatibilidade com versões antigas
+        res = client.chat(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return (res.choices[0].message.content or "").strip()
+
+
+class GoogleSdkLLM(LLM):
+    api_key: str
+    model: str
+
+    @property
+    def _llm_type(self) -> str:
+        return "google-generativeai-sdk"
+
+    def _call(self, prompt: str, stop: list[str] | None = None, run_manager=None, **kwargs: Any) -> str:
+        del stop, run_manager, kwargs
+        import google.generativeai as genai
+
+        genai.configure(api_key=self.api_key)
+        gm = genai.GenerativeModel(self.model)
+        res = gm.generate_content(prompt)
+        txt = getattr(res, "text", None)
+        if txt:
+            return str(txt).strip()
+        # fallback para objetos com candidates/parts
+        candidates = getattr(res, "candidates", None) or []
+        if candidates:
+            parts = getattr(candidates[0].content, "parts", []) if getattr(candidates[0], "content", None) else []
+            joined = "".join(getattr(p, "text", "") for p in parts)
+            return joined.strip()
+        return ""
 
 
 def list_ollama_models(base_url: str) -> list[str]:
@@ -32,6 +114,82 @@ def list_ollama_models(base_url: str) -> list[str]:
         if name:
             models.append(name)
     return models
+
+
+def list_openai_models(api_key: str) -> list[str]:
+    if not api_key:
+        return []
+    try:
+        from openai import OpenAI
+    except Exception:
+        return []
+    try:
+        client = OpenAI(api_key=api_key)
+        data = client.models.list()
+        return sorted({m.id for m in data.data if getattr(m, "id", "")})
+    except Exception:
+        return []
+
+
+def list_mistral_models(api_key: str) -> list[str]:
+    if not api_key:
+        return []
+    try:
+        from mistralai import Mistral
+    except Exception:
+        return []
+    try:
+        client = Mistral(api_key=api_key)
+        if hasattr(client, "models") and hasattr(client.models, "list"):
+            data = client.models.list()
+            items = getattr(data, "data", data) or []
+            return sorted({getattr(m, "id", "") for m in items if getattr(m, "id", "")})
+    except Exception:
+        return []
+    return []
+
+
+def list_google_models(api_key: str) -> list[str]:
+    if not api_key:
+        return []
+    try:
+        import google.generativeai as genai
+    except Exception:
+        return []
+    try:
+        genai.configure(api_key=api_key)
+        out: list[str] = []
+        for m in genai.list_models():
+            name = getattr(m, "name", "")
+            methods = set(getattr(m, "supported_generation_methods", []) or [])
+            if not name or ("generateContent" not in methods and "generateText" not in methods):
+                continue
+            out.append(name.replace("models/", ""))
+        return sorted(set(out))
+    except Exception:
+        return []
+
+
+def build_sdk_llm(api_provider: str, *, api_key: str, model: str) -> Any:
+    p = (api_provider or "").strip().lower()
+    if not api_key:
+        raise ValueError(f"API key ausente para provider {p!r}.")
+    if not model:
+        raise ValueError(f"Modelo ausente para provider {p!r}.")
+
+    if p == "openai":
+        llm = OpenAISdkLLM(api_key=api_key, model=model)
+        setattr(llm, "_rag_provider_used", "api:openai")
+        return llm
+    if p == "mistral":
+        llm = MistralSdkLLM(api_key=api_key, model=model)
+        setattr(llm, "_rag_provider_used", "api:mistral")
+        return llm
+    if p == "google":
+        llm = GoogleSdkLLM(api_key=api_key, model=model)
+        setattr(llm, "_rag_provider_used", "api:google")
+        return llm
+    raise ValueError("API_PROVIDER inválido. Use 'openai', 'mistral' ou 'google'.")
 
 
 def _build_hf_llm(settings: Settings) -> Any:
@@ -107,6 +265,7 @@ def build_llm(settings: Settings) -> Any:
     - provider=ollama: usa `ChatOllama` (LLM local via Ollama)
     - provider=hf: usa `HuggingFacePipeline` (modelo local via transformers)
     - provider=gguf: usa `LlamaCpp` (llama.cpp) com arquivo .gguf local
+    - provider=api: usa SDK oficial (OpenAI, Mistral ou Google Generative AI)
     """
     provider = (settings.rag_provider or "").lower().strip()
 
@@ -153,7 +312,21 @@ def build_llm(settings: Settings) -> Any:
     if provider in {"gguf", "llamacpp", "llama.cpp"}:
         return _build_gguf_llm(settings)
 
+    if provider == "api":
+        keys = {
+            "openai": settings.openai_api_key,
+            "mistral": settings.mistral_api_key,
+            "google": settings.google_api_key,
+        }
+        models = {
+            "openai": settings.openai_model,
+            "mistral": settings.mistral_model,
+            "google": settings.google_model,
+        }
+        p = settings.api_provider
+        return build_sdk_llm(p, api_key=keys.get(p, ""), model=models.get(p, ""))
+
     raise ValueError(
-        "RAG_PROVIDER inválido. Use 'ollama', 'hf' ou 'gguf'. "
+        "RAG_PROVIDER inválido. Use 'ollama', 'hf', 'gguf' ou 'api'. "
         f"Recebido: {settings.rag_provider!r}"
     )

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import httpx
 from PySide6.QtCore import QProcess, QSettings, Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -37,16 +38,32 @@ from PySide6.QtWidgets import (
 )
 
 from rag_local.config import get_settings
-from rag_local.llm import list_ollama_models
+from rag_local.llm import (
+    build_sdk_llm,
+    list_google_models,
+    list_mistral_models,
+    list_ollama_models,
+    list_openai_models,
+)
 from rag_local.loaders import load_documents
 from rag_local.rag import answer_with_sources, index_documents
 
 
+def _configure_logging() -> None:
+    lvl = logging.DEBUG if os.getenv("RAG_DEBUG", "").strip() in {"1", "true", "True", "yes"} else logging.INFO
+    logging.basicConfig(level=lvl, format="%(levelname)s %(name)s: %(message)s")
+
+
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class ApiConfig:
-    base_url: str
-    api_key: str
+    provider: str
     model: str
+    openai_api_key: str
+    mistral_api_key: str
+    google_api_key: str
 
 
 def _list_hf_models_in_dir(root: Path) -> list[str]:
@@ -304,14 +321,15 @@ class AskWorker(QThread):
         if provider == "api":
             if not self.api_cfg:
                 raise ValueError("Configuração de API não definida.")
-            # OpenAI-compatible API
-            from langchain_openai import ChatOpenAI
-
-            return ChatOpenAI(
+            api_key_map = {
+                "openai": self.api_cfg.openai_api_key,
+                "mistral": self.api_cfg.mistral_api_key,
+                "google": self.api_cfg.google_api_key,
+            }
+            return build_sdk_llm(
+                self.api_cfg.provider,
+                api_key=api_key_map.get(self.api_cfg.provider, ""),
                 model=self.api_cfg.model,
-                api_key=self.api_cfg.api_key,
-                base_url=self.api_cfg.base_url,
-                temperature=0.2,
             )
 
         raise ValueError("Provider inválido. Use ollama/hf/api.")
@@ -327,11 +345,9 @@ class AskWorker(QThread):
             if not q:
                 raise ValueError("Pergunta vazia.")
 
-            # prompt do sistema: prefixa na pergunta (compatível com chains clássicas)
-            if self.system_prompt.strip():
-                q = f"SISTEMA:\n{self.system_prompt.strip()}\n\nUSUÁRIO:\n{q}"
-
-            res = answer_with_sources(settings, llm, q)
+            res = answer_with_sources(
+                settings, llm, q, extra_instructions=(self.system_prompt or "").strip()
+            )
             out = res.get("result") if isinstance(res, dict) else str(res)
             src_docs = res.get("source_documents", []) if isinstance(res, dict) else []
             sources = []
@@ -344,6 +360,7 @@ class AskWorker(QThread):
                 sources.append({"source": src, "page": page, "snippet": snippet})
             self.done.emit(str(out), sources)
         except Exception as e:
+            logging.getLogger(__name__).exception("Falha no AskWorker")
             self.failed.emit(str(e))
 
 
@@ -351,19 +368,14 @@ class IngestWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, docs_dir: str, reset: bool) -> None:
+    def __init__(self, docs_dir: str) -> None:
         super().__init__()
         self.docs_dir = docs_dir
-        self.reset = reset
 
     def run(self) -> None:
         try:
             s = get_settings()
             docs_path = Path(self.docs_dir)
-            if self.reset and s.chroma_dir.exists():
-                import shutil
-
-                shutil.rmtree(s.chroma_dir)
             docs = load_documents(docs_path)
             n_docs, n_chunks = index_documents(s, docs)
 
@@ -371,14 +383,27 @@ class IngestWorker(QThread):
 
             c = Counter(d.metadata.get("source") for d in docs)
             breakdown = "\n".join(f"- {k}: {v}" for k, v in c.items())
-            msg = f"OK docs={n_docs} chunks={n_chunks}\n\nDocs carregados:\n{breakdown}"
+            msg = (
+                f"Índice recriado (Chroma zerado antes de indexar). "
+                f"docs={n_docs}, chunks={n_chunks}\n\nArquivos carregados:\n{breakdown}"
+            )
             self.done.emit(msg)
         except Exception as e:
+            logging.getLogger(__name__).exception("Falha no IngestWorker")
             self.failed.emit(str(e))
 
 
 @dataclass
 class ChatEntry:
+    question: str
+    answer: str
+    sources: list
+
+
+@dataclass
+class SessionQARow:
+    at: str
+    provider: str
     question: str
     answer: str
     sources: list
@@ -399,7 +424,7 @@ class ChatPane:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("RAG Local (Ollama / HF / API)")
+        self.setWindowTitle("RAG Local — perguntas com seus documentos")
         self.resize(1100, 700)
 
         self.settings = QSettings("rag_local", "rag_gui")
@@ -408,22 +433,32 @@ class MainWindow(QMainWindow):
         self.ingest_worker: Optional[IngestWorker] = None
         self.chat_panes: dict[str, ChatPane] = {}
         self.chat_history: dict[str, list[ChatEntry]] = {"ollama": [], "hf": [], "api": []}
+        self.session_log: list[SessionQARow] = []
         self._pending_provider_for_answer: Optional[str] = None
 
         self._build_ui()
+        self._refresh_embed_info()
         self._load_state()
         self._refresh_models()
 
     def _build_ui(self) -> None:
         toolbar = QToolBar("Main")
         self.addToolBar(toolbar)
-        act_refresh = QAction("Atualizar modelos", self)
+        act_refresh = QAction("Atualizar lista de modelos", self)
         act_refresh.triggered.connect(self._refresh_models)
         toolbar.addAction(act_refresh)
 
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+
+        lbl_flow = QLabel(
+            "Fluxo rápido: configure o modelo de IA acima → na seção “Base de documentos” escolha a pasta dos "
+            "arquivos e clique “Indexar” → digite sua pergunta na aba Chat e envie."
+        )
+        lbl_flow.setWordWrap(True)
+        lbl_flow.setStyleSheet("padding: 4px 0 8px 0; color: palette(mid);")
+        layout.addWidget(lbl_flow)
 
         # Painel principal
         main = QWidget()
@@ -435,7 +470,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        gb_provider = QGroupBox("Provedor")
+        gb_provider = QGroupBox("Modelo de linguagem (gera a resposta)")
         vprov = QVBoxLayout(gb_provider)
         self.tabs = QTabWidget()
         self.tabs.currentChanged.connect(lambda _i: self._refresh_models())
@@ -515,13 +550,22 @@ class MainWindow(QMainWindow):
 
         gb_api_cfg = QGroupBox("Configuração (API)")
         f_api = QFormLayout(gb_api_cfg)
-        self.le_api_base = QLineEdit()
-        self.le_api_base.setPlaceholderText("https://api.openai.com/v1 (ou compatível)")
-        f_api.addRow("base_url", self.le_api_base)
+        self.cb_api_provider = QComboBox()
+        self.cb_api_provider.addItems(["openai", "mistral", "google"])
+        self.cb_api_provider.currentIndexChanged.connect(lambda _x: self._refresh_models())
+        f_api.addRow("Provider SDK", self.cb_api_provider)
 
-        self.le_api_key = QLineEdit()
-        self.le_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        f_api.addRow("api_key", self.le_api_key)
+        self.le_openai_key = QLineEdit()
+        self.le_openai_key.setEchoMode(QLineEdit.EchoMode.Password)
+        f_api.addRow("OPENAI_API_KEY", self.le_openai_key)
+
+        self.le_mistral_key = QLineEdit()
+        self.le_mistral_key.setEchoMode(QLineEdit.EchoMode.Password)
+        f_api.addRow("MISTRAL_API_KEY", self.le_mistral_key)
+
+        self.le_google_key = QLineEdit()
+        self.le_google_key.setEchoMode(QLineEdit.EchoMode.Password)
+        f_api.addRow("GOOGLE_API_KEY", self.le_google_key)
 
         self.cb_api_model = QComboBox()
         self.cb_api_model.setEditable(True)
@@ -537,49 +581,88 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab_api, "API")
 
         # RAG
-        gb_rag = QGroupBox("RAG")
+        gb_rag = QGroupBox("Recuperação (busca nos documentos)")
         form2 = QFormLayout(gb_rag)
         self.sp_topk = QSpinBox()
         self.sp_topk.setMinimum(1)
         self.sp_topk.setMaximum(20)
-        form2.addRow("top_k", self.sp_topk)
+        self.sp_topk.setToolTip("Quantos trechos recuperar antes de responder (maior = mais contexto, mais texto).")
+        form2.addRow("Trechos a recuperar (top_k)", self.sp_topk)
+
+        self.lbl_embed_model = QLabel("")
+        self.lbl_embed_model.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_embed_model.setWordWrap(True)
+        form2.addRow("Modelo de embeddings", self.lbl_embed_model)
+
+        self.lbl_chroma_path = QLabel("")
+        self.lbl_chroma_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        form2.addRow("Pasta do índice (Chroma)", self.lbl_chroma_path)
 
         # Indexação
-        gb_ingest = QGroupBox("Indexação (docs → Chroma)")
+        gb_ingest = QGroupBox("Base de documentos (PDF, TXT ou MD)")
         form_ing = QFormLayout(gb_ingest)
         self.le_docs_dir = QLineEdit()
+        self.le_docs_dir.setPlaceholderText("Pasta com os arquivos a consultar…")
         self.btn_docs_pick = QPushButton("Selecionar pasta…")
         self.btn_docs_pick.clicked.connect(self._pick_docs_dir)
         row_docs = QHBoxLayout()
         row_docs.addWidget(self.le_docs_dir)
         row_docs.addWidget(self.btn_docs_pick)
-        form_ing.addRow("Docs pasta", row_docs)
+        form_ing.addRow("Pasta dos documentos", row_docs)
 
-        self.chk_ingest_reset = QCheckBox("Reset (apagar índice .chroma antes)")
-        form_ing.addRow("", self.chk_ingest_reset)
+        hint_ix = QLabel(
+            "Ao indexar, o sistema apaga o banco vetorial anterior e monta um índice novo com os "
+            "arquivos encontrados nesta pasta (subpastas inclusas)."
+        )
+        hint_ix.setWordWrap(True)
+        hint_ix.setStyleSheet("color: palette(mid);")
+        form_ing.addRow("", hint_ix)
 
-        self.btn_ingest = QPushButton("Reindexar agora")
+        self.btn_ingest = QPushButton("Indexar documentos")
         self.btn_ingest.clicked.connect(self._ingest)
         form_ing.addRow("", self.btn_ingest)
 
         self.lbl_ingest_status = QLabel("")
         self.lbl_ingest_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        form_ing.addRow("Status", self.lbl_ingest_status)
+        form_ing.addRow("Última indexação", self.lbl_ingest_status)
 
-        # prompt de sistema
-        gb_prompt = QGroupBox("Prompt do sistema (personalize sua IA)")
+        # notas adicionais (o RAG aplica em rag.py prompt antialucinação fixo; a recuperação usa só a pergunta)
+        gb_prompt = QGroupBox("Notas adicionais ao modelo (opcional; além do prompt antialucinação do RAG)")
         v = QVBoxLayout(gb_prompt)
         self.te_system = QTextEdit()
         self.te_system.setPlaceholderText(
-            "Ex.: Você é um assistente objetivo. Responda sempre em português e cite páginas quando possível."
+            "Ex.: Pedir tabela em markdown, ou reforçar o tom. Não use isto para “colar” o contexto — a busca usa só a pergunta."
         )
         v.addWidget(self.te_system)
+
+        gb_session = QGroupBox("Todas as interações (esta execução)")
+        vsess = QVBoxLayout(gb_session)
+        self.lbl_session_note = QLabel(
+            "Cada pergunta/resposta fica listada abaixo para consulta. Ao fechar a janela, este registo é apagado e não fica em disco."
+        )
+        self.lbl_session_note.setWordWrap(True)
+        self.lbl_session_note.setStyleSheet("color: palette(mid);")
+        vsess.addWidget(self.lbl_session_note)
+        sess_split = QSplitter(Qt.Orientation.Horizontal)
+        self.lst_session = QListWidget()
+        self.lst_session.setMinimumWidth(260)
+        self.te_session_detail = QTextEdit()
+        self.te_session_detail.setReadOnly(True)
+        self.te_session_detail.setPlaceholderText("Selecione um item do registo para ver a pergunta, a resposta e as fontes…")
+        sess_split.addWidget(self.lst_session)
+        sess_split.addWidget(self.te_session_detail)
+        sess_split.setStretchFactor(0, 0)
+        sess_split.setStretchFactor(1, 1)
+        sess_split.setSizes([300, 520])
+        vsess.addWidget(sess_split, 1)
+        self.lst_session.currentRowChanged.connect(self._on_session_row)
 
         left_layout.addWidget(gb_provider)
         left_layout.addWidget(gb_rag)
         left_layout.addWidget(gb_ingest)
         left_layout.addWidget(gb_prompt)
-        left_layout.addStretch(1)
+        left_layout.addWidget(gb_session, 1)
+        left_layout.addStretch(0)
 
         main_layout.addWidget(left, 1)
 
@@ -613,6 +696,7 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         btn_ask = QPushButton("Perguntar")
         btn_ask.setMinimumHeight(34)
+        btn_ask.setToolTip("Atalho na caixa da pergunta: Ctrl+Enter")
         btn_save_txt = QPushButton("Salvar TXT")
         btn_save_pdf = QPushButton("Salvar PDF")
         btn_row.addWidget(btn_ask)
@@ -664,6 +748,9 @@ class MainWindow(QMainWindow):
         lst.currentRowChanged.connect(lambda idx: self._load_history_item(provider_key, idx))
         btn_clear.clicked.connect(lambda: self._clear_history(provider_key))
 
+        sc = QShortcut(QKeySequence("Ctrl+Return"), te_q)
+        sc.activated.connect(lambda k=provider_key: self._ask(k))
+
         return gb
 
     def _load_state(self) -> None:
@@ -682,30 +769,20 @@ class MainWindow(QMainWindow):
         self.sp_hf_max.setValue(int(self.settings.value("hf_max", s.hf_max_new_tokens)))
         self.sp_topk.setValue(int(self.settings.value("topk", s.top_k)))
         self.te_system.setPlainText(self.settings.value("system_prompt", ""))
-        self.le_api_base.setText(self.settings.value("api_base", ""))
-        self.le_api_key.setText(self.settings.value("api_key", ""))
+        self.cb_api_provider.setCurrentText(self.settings.value("api_provider", s.api_provider))
+        self.le_openai_key.setText(self.settings.value("openai_api_key", s.openai_api_key))
+        self.le_mistral_key.setText(self.settings.value("mistral_api_key", s.mistral_api_key))
+        self.le_google_key.setText(self.settings.value("google_api_key", s.google_api_key))
         self.cb_hf_model.setCurrentText(self.settings.value("hf_model", s.hf_model))
-        self.cb_api_model.setCurrentText(self.settings.value("api_model", ""))
+        default_api_model = {
+            "openai": s.openai_model,
+            "mistral": s.mistral_model,
+            "google": s.google_model,
+        }.get(self.cb_api_provider.currentText().strip().lower(), s.openai_model)
+        self.cb_api_model.setCurrentText(self.settings.value("api_model", default_api_model))
         self.chk_ollama_auto.setChecked(self.settings.value("ollama_auto", "false") == "true")
         self.chk_hf_simple.setChecked(self.settings.value("hf_simple", "true") == "true")
-        self.chk_ingest_reset.setChecked(self.settings.value("ingest_reset", "false") == "true")
-
-        # Histórico por provedor
-        try:
-            raw = self.settings.value("chat_history_json", "")
-            if raw:
-                data = json.loads(raw)
-                for key in ("ollama", "hf", "api"):
-                    self.chat_history[key] = [
-                        ChatEntry(
-                            question=item.get("q", ""),
-                            answer=item.get("a", ""),
-                            sources=item.get("s", []) or [],
-                        )
-                        for item in (data.get(key) or [])
-                    ]
-        except Exception:
-            pass
+        # Histórico de chat: só em memória; não reabre do disco (e é apagado ao fechar a aplicação).
         self._refresh_history_lists()
 
     def _save_state(self) -> None:
@@ -717,26 +794,43 @@ class MainWindow(QMainWindow):
         self.settings.setValue("hf_max", self.sp_hf_max.value())
         self.settings.setValue("topk", self.sp_topk.value())
         self.settings.setValue("system_prompt", self.te_system.toPlainText())
-        self.settings.setValue("api_base", self.le_api_base.text().strip())
-        self.settings.setValue("api_key", self.le_api_key.text())
+        self.settings.setValue("api_provider", self.cb_api_provider.currentText().strip().lower())
+        self.settings.setValue("openai_api_key", self.le_openai_key.text())
+        self.settings.setValue("mistral_api_key", self.le_mistral_key.text())
+        self.settings.setValue("google_api_key", self.le_google_key.text())
         self.settings.setValue("hf_model", self.cb_hf_model.currentText().strip())
         self.settings.setValue("api_model", self.cb_api_model.currentText().strip())
         self.settings.setValue("ollama_auto", "true" if self.chk_ollama_auto.isChecked() else "false")
         self.settings.setValue("hf_simple", "true" if self.chk_hf_simple.isChecked() else "false")
-        self.settings.setValue("ingest_reset", "true" if self.chk_ingest_reset.isChecked() else "false")
 
-        # salva histórico
-        try:
-            data = {}
-            for key, items in self.chat_history.items():
-                data[key] = [{"q": it.question, "a": it.answer, "s": it.sources} for it in items[-200:]]
-            self.settings.setValue("chat_history_json", json.dumps(data, ensure_ascii=False))
-        except Exception:
-            pass
+    def _wipe_all_qa_data(self) -> None:
+        self.session_log.clear()
+        for k in self.chat_history:
+            self.chat_history[k] = []
+        if hasattr(self, "lst_session"):
+            self.lst_session.clear()
+        if hasattr(self, "te_session_detail"):
+            self.te_session_detail.clear()
 
     def closeEvent(self, event):  # noqa: N802
+        self._wipe_all_qa_data()
         self._save_state()
+        try:
+            self.settings.remove("chat_history_json")
+        except Exception:
+            self.settings.setValue("chat_history_json", "")
         super().closeEvent(event)
+
+    def _refresh_embed_info(self) -> None:
+        s = get_settings()
+        self.lbl_embed_model.setText(
+            f"{s.embed_provider} → {s.embed_model}\n"
+            "(.env: EMBED_PROVIDER=ollama|huggingface, EMBED_MODEL; padrão Ollama nomic-embed-text:latest)"
+        )
+        try:
+            self.lbl_chroma_path.setText(str(s.chroma_dir.resolve()))
+        except OSError:
+            self.lbl_chroma_path.setText(str(s.chroma_dir))
 
     def _pick_hf_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Selecione a pasta de modelos/cache HF")
@@ -761,12 +855,40 @@ class MainWindow(QMainWindow):
             pane.lst_history.blockSignals(False)
 
     def _clear_history(self, provider_key: str) -> None:
+        self.session_log = [r for r in self.session_log if r.provider != provider_key]
+        self._refresh_session_list()
+        if not self.session_log and hasattr(self, "te_session_detail"):
+            self.te_session_detail.clear()
         self.chat_history[provider_key] = []
         self._refresh_history_lists()
         pane = self.chat_panes[provider_key]
         pane.te_question.clear()
         pane.te_answer.clear()
         pane.te_sources.clear()
+
+    def _refresh_session_list(self) -> None:
+        if not hasattr(self, "lst_session"):
+            return
+        self.lst_session.blockSignals(True)
+        self.lst_session.clear()
+        for i, row in enumerate(self.session_log, 1):
+            prev = row.question.strip().replace("\n", " ")
+            if len(prev) > 72:
+                prev = prev[:72] + "…"
+            self.lst_session.addItem(QListWidgetItem(f"{i}. [{row.provider}] {row.at} — {prev}"))
+        self.lst_session.blockSignals(False)
+
+    def _on_session_row(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self.session_log):
+            return
+        row = self.session_log[idx]
+        src_text = (
+            json.dumps(row.sources, ensure_ascii=False, indent=2) if row.sources else "(nenhuma fonte)"
+        )
+        self.te_session_detail.setPlainText(
+            f"Provedor: {row.provider}\nHora: {row.at}\n\n--- Pergunta ---\n{row.question}\n\n"
+            f"--- Resposta ---\n{row.answer}\n\n--- Fontes (bruto) ---\n{src_text}"
+        )
 
     def _load_history_item(self, provider_key: str, idx: int) -> None:
         if idx < 0:
@@ -813,17 +935,22 @@ class MainWindow(QMainWindow):
             return
 
         if provider == "api":
-            base = self.le_api_base.text().strip()
-            key = self.le_api_key.text()
-            if not base:
+            api_provider = self.cb_api_provider.currentText().strip().lower() or "openai"
+            key_map = {
+                "openai": self.le_openai_key.text(),
+                "mistral": self.le_mistral_key.text(),
+                "google": self.le_google_key.text(),
+            }
+            key = key_map.get(api_provider, "")
+            if not key:
                 return
             try:
-                headers = {"Authorization": f"Bearer {key}"} if key else {}
-                r = httpx.get(base.rstrip("/") + "/models", headers=headers, timeout=10)
-                r.raise_for_status()
-                data = r.json()
-                items = data.get("data", [])
-                models = sorted({it.get("id") for it in items if it.get("id")})
+                if api_provider == "openai":
+                    models = list_openai_models(key)
+                elif api_provider == "mistral":
+                    models = list_mistral_models(key)
+                else:
+                    models = list_google_models(key)
                 current = self.cb_api_model.currentText().strip()
                 self.cb_api_model.clear()
                 self.cb_api_model.addItems(models)
@@ -892,12 +1019,17 @@ class MainWindow(QMainWindow):
         provider = self.tabs.tabText(self.tabs.currentIndex()).lower()
         if not provider.startswith("api"):
             return None
-        base = self.le_api_base.text().strip()
-        key = self.le_api_key.text()
+        api_provider = self.cb_api_provider.currentText().strip().lower() or "openai"
         model = self.cb_api_model.currentText().strip()
-        if not base or not model:
+        if not model:
             return None
-        return ApiConfig(base_url=base.rstrip("/"), api_key=key, model=model)
+        return ApiConfig(
+            provider=api_provider,
+            model=model,
+            openai_api_key=self.le_openai_key.text(),
+            mistral_api_key=self.le_mistral_key.text(),
+            google_api_key=self.le_google_key.text(),
+        )
 
     def _ask(self, provider: str) -> None:
         self._save_state()
@@ -945,11 +1077,10 @@ class MainWindow(QMainWindow):
     def _ingest(self) -> None:
         self._save_state()
         docs_dir = self.le_docs_dir.text().strip() or "docs"
-        reset = self.chk_ingest_reset.isChecked()
         self.btn_ingest.setEnabled(False)
-        self.lbl_ingest_status.setText("Indexando…")
+        self.lbl_ingest_status.setText("Indexando… (recriando banco vetorial)")
 
-        self.ingest_worker = IngestWorker(docs_dir=docs_dir, reset=reset)
+        self.ingest_worker = IngestWorker(docs_dir=docs_dir)
         self.ingest_worker.done.connect(self._on_ingest_done)
         self.ingest_worker.failed.connect(self._on_ingest_fail)
         self.ingest_worker.start()
@@ -973,7 +1104,19 @@ class MainWindow(QMainWindow):
 
             q = pane.te_question.toPlainText()
             self.chat_history[provider].append(ChatEntry(question=q, answer=text, sources=sources))
+            self.session_log.append(
+                SessionQARow(
+                    at=datetime.now().strftime("%H:%M:%S"),
+                    provider=provider,
+                    question=q,
+                    answer=text,
+                    sources=sources,
+                )
+            )
             self._refresh_history_lists()
+            self._refresh_session_list()
+            if self.lst_session.count() > 0:
+                self.lst_session.setCurrentRow(self.lst_session.count() - 1)
             pane.lst_history.setCurrentRow(len(self.chat_history[provider]) - 1)
         self._pending_provider_for_answer = None
 
@@ -1011,6 +1154,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    _configure_logging()
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
