@@ -6,6 +6,8 @@ from langchain_core.language_models.llms import LLM
 
 
 class OpenAISdkLLM(LLM):
+    """LangChain LLM using the official OpenAI Chat Completions API."""
+
     api_key: str
     model: str
 
@@ -14,6 +16,17 @@ class OpenAISdkLLM(LLM):
         return "openai-sdk"
 
     def _call(self, prompt: str, stop: list[str] | None = None, run_manager=None, **kwargs: Any) -> str:
+        """Run a chat completion with a single user message.
+
+        Args:
+            prompt: Full prompt text sent as user content.
+            stop: Stop sequences (ignored; LangChain hook compatibility).
+            run_manager: Callback manager (ignored).
+            **kwargs: Extra arguments (ignored).
+
+        Returns:
+            Trimmed assistant message content.
+        """
         del stop, run_manager, kwargs
         from openai import OpenAI
 
@@ -28,6 +41,8 @@ class OpenAISdkLLM(LLM):
 
 
 class MistralSdkLLM(LLM):
+    """LangChain LLM using the Mistral client chat API."""
+
     api_key: str
     model: str
 
@@ -36,6 +51,17 @@ class MistralSdkLLM(LLM):
         return "mistral-sdk"
 
     def _call(self, prompt: str, stop: list[str] | None = None, run_manager=None, **kwargs: Any) -> str:
+        """Run chat completion, supporting multiple Mistral SDK variants.
+
+        Args:
+            prompt: User message content.
+            stop: Unused (compatibility).
+            run_manager: Unused.
+            **kwargs: Unused.
+
+        Returns:
+            Trimmed assistant text.
+        """
         del stop, run_manager, kwargs
         from mistralai import Mistral
 
@@ -60,6 +86,8 @@ class MistralSdkLLM(LLM):
 
 
 class GoogleSdkLLM(LLM):
+    """LangChain LLM using Google Generative AI ``GenerativeModel.generate_content``."""
+
     api_key: str
     model: str
 
@@ -68,6 +96,17 @@ class GoogleSdkLLM(LLM):
         return "google-generativeai-sdk"
 
     def _call(self, prompt: str, stop: list[str] | None = None, run_manager=None, **kwargs: Any) -> str:
+        """Generate text from ``prompt`` via Gemini.
+
+        Args:
+            prompt: Raw prompt string.
+            stop: Unused.
+            run_manager: Unused.
+            **kwargs: Unused.
+
+        Returns:
+            Generated text, or empty string if none.
+        """
         del stop, run_manager, kwargs
         import google.generativeai as genai
 
@@ -87,6 +126,14 @@ class GoogleSdkLLM(LLM):
 
 
 def list_ollama_models(base_url: str) -> list[str]:
+    """List installed Ollama models exposed by the server.
+
+    Args:
+        base_url: Ollama API base URL (e.g. ``http://localhost:11434``).
+
+    Returns:
+        Model names, or an empty list if the client is missing or the call fails.
+    """
     try:
         import ollama
     except Exception:
@@ -117,6 +164,14 @@ def list_ollama_models(base_url: str) -> list[str]:
 
 
 def list_openai_models(api_key: str) -> list[str]:
+    """List OpenAI model ids visible to the given API key.
+
+    Args:
+        api_key: OpenAI API key.
+
+    Returns:
+        Sorted unique model ids, or empty list if unavailable.
+    """
     if not api_key:
         return []
     try:
@@ -132,6 +187,14 @@ def list_openai_models(api_key: str) -> list[str]:
 
 
 def list_mistral_models(api_key: str) -> list[str]:
+    """List Mistral model ids when the client supports ``models.list``.
+
+    Args:
+        api_key: Mistral API key.
+
+    Returns:
+        Sorted unique model ids, or empty list on failure.
+    """
     if not api_key:
         return []
     try:
@@ -150,6 +213,14 @@ def list_mistral_models(api_key: str) -> list[str]:
 
 
 def list_google_models(api_key: str) -> list[str]:
+    """List Google Generative AI models that support generation, without ``models/`` prefix.
+
+    Args:
+        api_key: Google API key.
+
+    Returns:
+        Sorted model name strings, or empty list on failure.
+    """
     if not api_key:
         return []
     try:
@@ -171,6 +242,19 @@ def list_google_models(api_key: str) -> list[str]:
 
 
 def build_sdk_llm(api_provider: str, *, api_key: str, model: str) -> Any:
+    """Build an SDK-backed LangChain LLM for cloud APIs.
+
+    Args:
+        api_provider: One of ``openai``, ``mistral``, ``google``.
+        api_key: Provider API key.
+        model: Model name or id for that provider.
+
+    Returns:
+        ``OpenAISdkLLM``, ``MistralSdkLLM``, or ``GoogleSdkLLM``.
+
+    Raises:
+        ValueError: If API key or model is missing, or provider is unknown.
+    """
     p = (api_provider or "").strip().lower()
     if not api_key:
         raise ValueError(f"API key ausente para provider {p!r}.")
@@ -193,6 +277,14 @@ def build_sdk_llm(api_provider: str, *, api_key: str, model: str) -> Any:
 
 
 def _build_hf_llm(settings: Settings) -> Any:
+    """Build a Hugging Face causal LM pipeline wrapped as ``HuggingFacePipeline``.
+
+    Args:
+        settings: HF model id, cache dir, device, and generation limits.
+
+    Returns:
+        LangChain ``HuggingFacePipeline``; sets ``_rag_provider_used`` to ``hf``.
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
     from langchain_huggingface import HuggingFacePipeline
 
@@ -222,6 +314,17 @@ def _build_hf_llm(settings: Settings) -> Any:
 
 
 def _build_gguf_llm(settings: Settings) -> Any:
+    """Build a ``LlamaCpp`` LLM from a local GGUF file path.
+
+    Args:
+        settings: Must define ``gguf_model_path`` and GGUF-related options.
+
+    Returns:
+        ``LlamaCpp`` instance; sets ``_rag_provider_used`` to ``gguf``.
+
+    Raises:
+        ValueError: If path is missing, missing file, or not a ``.gguf`` file.
+    """
     from langchain_community.llms import LlamaCpp
 
     model_path = (settings.gguf_model_path or "").strip()
@@ -245,6 +348,14 @@ def _build_gguf_llm(settings: Settings) -> Any:
 
 
 def _ollama_reachable(base_url: str) -> bool:
+    """Return whether the Ollama HTTP API responds to ``list`` at ``base_url``.
+
+    Args:
+        base_url: Ollama server URL.
+
+    Returns:
+        True if listing succeeds; False if client missing or server unreachable.
+    """
     try:
         import ollama
     except Exception:
@@ -259,13 +370,23 @@ def _ollama_reachable(base_url: str) -> bool:
 
 
 def build_llm(settings: Settings) -> Any:
-    """
-    Retorna um LLM compatível com LangChain.
+    """Return a LangChain LLM according to ``settings.rag_provider``.
 
-    - provider=ollama: usa `ChatOllama` (LLM local via Ollama)
-    - provider=hf: usa `HuggingFacePipeline` (modelo local via transformers)
-    - provider=gguf: usa `LlamaCpp` (llama.cpp) com arquivo .gguf local
-    - provider=api: usa SDK oficial (OpenAI, Mistral ou Google Generative AI)
+    Behavior by provider:
+
+    * ``ollama``: ``ChatOllama``; if the server is unreachable, falls back to HF pipeline.
+    * ``hf`` / ``huggingface`` / ``transformers``: Hugging Face pipeline.
+    * ``gguf`` / ``llamacpp`` / ``llama.cpp``: llama.cpp via ``LlamaCpp``.
+    * ``api``: SDK wrapper for OpenAI, Mistral, or Google.
+
+    Args:
+        settings: Full configuration including provider-specific fields.
+
+    Returns:
+        A LangChain-compatible runnable LLM.
+
+    Raises:
+        ValueError: Unknown ``rag_provider``, missing Ollama model match, invalid GGUF path, etc.
     """
     provider = (settings.rag_provider or "").lower().strip()
 

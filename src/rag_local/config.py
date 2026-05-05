@@ -7,6 +7,12 @@ import os
 
 @dataclass(frozen=True)
 class Settings:
+    """Immutable application configuration loaded from environment variables.
+
+    See Also:
+        get_settings: Factory that reads ``os.environ`` and returns ``Settings``.
+    """
+
     rag_provider: str
 
     ollama_model: str
@@ -40,6 +46,18 @@ class Settings:
 
 
 def _get_int(name: str, default: int) -> int:
+    """Parse an environment variable as ``int``.
+
+    Args:
+        name: Environment variable name.
+        default: Value used when the variable is unset or empty.
+
+    Returns:
+        Parsed integer, or ``default`` when unset/empty.
+
+    Raises:
+        ValueError: If the variable is set but not a valid integer.
+    """
     raw = os.getenv(name, "").strip()
     if raw == "":
         return default
@@ -50,11 +68,28 @@ def _get_int(name: str, default: int) -> int:
 
 
 def _get_str(name: str, default: str) -> str:
+    """Return a string environment variable or a default.
+
+    Args:
+        name: Environment variable name.
+        default: Value used when the variable is unset or empty.
+
+    Returns:
+        Stripped non-empty value from the environment, or ``default``.
+    """
     raw = os.getenv(name, "").strip()
     return raw if raw else default
 
 
 def get_settings() -> Settings:
+    """Load ``.env`` (without overriding existing variables) and build ``Settings``.
+
+    Returns:
+        Validated ``Settings`` instance.
+
+    Raises:
+        ValueError: If ``EMBED_PROVIDER``, ``API_PROVIDER``, or related values are invalid.
+    """
     load_dotenv(override=False)
 
     raw_ep = os.getenv("EMBED_PROVIDER", "").strip()

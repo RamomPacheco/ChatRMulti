@@ -19,7 +19,7 @@ from rag_local.loaders import load_documents
 from rag_local.rag import answer, answer_with_sources, index_documents
 
 
-app = typer.Typer(add_completion=False, help="RAG local (Ollama/HF) com LangChain.")
+app = typer.Typer(add_completion=False, help="Local RAG (Ollama/HF) with LangChain.")
 console = Console()
 logger = logging.getLogger(__name__)
 
@@ -27,19 +27,23 @@ logger = logging.getLogger(__name__)
 @app.command()
 def ingest(
     docs_dir: Optional[Path] = typer.Option(
-        None, "--docs", "-d", help="Pasta com .pdf/.txt/.md para indexar."
+        None, "--docs", "-d", help="Directory with .pdf/.txt/.md files to index."
     ),
     append: bool = typer.Option(
         False,
         "--append",
         "--keep-index",
-        help="Não apagar o índice (.chroma) antes; acrescenta ao existente.",
+        help="Do not delete the (.chroma) index first; append to the existing store.",
     ),
 ):
-    """
-    Indexa documentos no Chroma.
+    """Index documents into Chroma from a folder.
 
-    Por padrão remove o índice vetorial anterior antes de nova indexação.
+    By default deletes the existing vector store directory before indexing unless
+    ``--append`` is set.
+
+    Args:
+        docs_dir: Directory with PDF/TXT/MD files; defaults to ``DOCS_DIR`` from settings.
+        append: If True, keep existing Chroma data and add chunks (append mode).
     """
     logging.basicConfig(level=(logging.DEBUG if __import__("os").getenv("RAG_DEBUG") else logging.INFO))
 
@@ -80,13 +84,16 @@ def ingest(
 
 @app.command()
 def ask(
-    question: str = typer.Argument(..., help="Pergunta para o seu RAG."),
+    question: str = typer.Argument(..., help="Question for your RAG."),
     sources: bool = typer.Option(
-        False, "--sources", help="Mostra os trechos/fontes recuperados."
+        False, "--sources", help="Print retrieved chunks/sources."
     ),
 ):
-    """
-    Faz uma pergunta usando recuperação + LLM local.
+    """Ask one question using retrieval-augmented generation.
+
+    Args:
+        question: Natural language query.
+        sources: If True, print retrieved source snippets after the answer.
     """
     settings = get_settings()
     try:
@@ -149,8 +156,12 @@ def ask(
 
 @app.command()
 def models():
-    """
-    Lista modelos disponíveis para o provider atual.
+    """List remote or local models for ``RAG_PROVIDER`` from settings.
+
+    Uses Ollama tags API, or cloud APIs when ``rag_provider`` is ``api``.
+
+    Returns:
+        None; prints a Rich panel to stdout.
     """
     s = get_settings()
     if s.rag_provider == "ollama":
@@ -175,8 +186,10 @@ def models():
 
 @app.command()
 def info():
-    """
-    Mostra a configuração efetiva (via .env / env vars).
+    """Print resolved configuration values from ``get_settings``.
+
+    Returns:
+        None; prints a Rich panel to stdout.
     """
     s = get_settings()
     console.print(

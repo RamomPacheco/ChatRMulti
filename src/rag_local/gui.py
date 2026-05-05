@@ -50,6 +50,11 @@ from rag_local.rag import answer_with_sources, index_documents
 
 
 def _configure_logging() -> None:
+    """Configure ``logging`` root level from the ``RAG_DEBUG`` environment variable.
+
+    Returns:
+        None
+    """
     lvl = logging.DEBUG if os.getenv("RAG_DEBUG", "").strip() in {"1", "true", "True", "yes"} else logging.INFO
     logging.basicConfig(level=lvl, format="%(levelname)s %(name)s: %(message)s")
 
@@ -59,6 +64,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ApiConfig:
+    """API provider name, model id, and provider API key fields for the GUI."""
+
     provider: str
     model: str
     openai_api_key: str
@@ -67,9 +74,13 @@ class ApiConfig:
 
 
 def _list_hf_models_in_dir(root: Path) -> list[str]:
-    """
-    Lista modelos dentro de uma pasta de cache HF.
-    Suporta estrutura padrão do huggingface_hub: models--org--name
+    """List HF hub-style model folders under a cache directory.
+
+    Args:
+        root: Hugging Face cache root (``models--org--name`` child folders).
+
+    Returns:
+        Sorted unique model ids as ``org/name`` strings.
     """
     root = Path(root)
     if not root.exists():
@@ -84,9 +95,13 @@ def _list_hf_models_in_dir(root: Path) -> list[str]:
 
 
 def _list_folder_models_simple(root: Path) -> list[str]:
-    """
-    Lista modelos quando o usuário aponta para uma pasta "direta" de modelos,
-    por exemplo: E:\\ComfyUI\\models\\LLM contendo subpastas de modelos.
+    """List immediate subfolders that look like unpacked HF or GGUF model dirs.
+
+    Args:
+        root: Parent directory containing one folder per model.
+
+    Returns:
+        Sorted folder names that pass the config/tokenizer/GGUF heuristic.
     """
     root = Path(root)
     if not root.exists():
@@ -103,15 +118,16 @@ def _list_folder_models_simple(root: Path) -> list[str]:
 
 
 def _discover_llm_models_recursive(root: Path) -> list[str]:
-    """
-    Descobre modelos baixados dentro de uma pasta, mesmo em subpastas.
+    """Discover model roots and standalone GGUF files under ``root`` recursively.
 
-    Heurísticas:
-    - diretório contendo `config.json` e/ou `tokenizer.json`
-    - diretório contendo arquivos `.safetensors` ou `.gguf`
+    Uses presence of ``config.json``, ``tokenizer.json``, ``.safetensors``, or ``.gguf``.
+    Normalizes ``snapshots/<hash>`` paths up to the repo folder.
 
-    Retorna identificadores no formato de caminho relativo (com '/').
-    Ex.: "Qwen-VL/Qwen3-VL-4B-Instruct"
+    Args:
+        root: Search root (HF cache or flat LLM directory).
+
+    Returns:
+        Sorted labels as paths with ``/`` separators relative to ``root``.
     """
     root = Path(root)
     if not root.exists():
@@ -175,10 +191,29 @@ def _discover_llm_models_recursive(root: Path) -> list[str]:
 
 
 def _save_text(path: Path, text: str) -> None:
+    """Save plain text to disk as UTF-8.
+
+    Args:
+        path: Output file path.
+        text: Full body to write.
+
+    Returns:
+        None
+    """
     path.write_text(text, encoding="utf-8")
 
 
 def _save_pdf(path: Path, text: str, title: str = "Resposta") -> None:
+    """Write wrapped plain text to a minimal PDF using ReportLab.
+
+    Args:
+        path: Output ``.pdf`` path.
+        text: Body text (line breaks preserved).
+        title: Heading drawn at the top of the first page.
+
+    Returns:
+        None
+    """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import cm
     from reportlab.pdfgen import canvas
@@ -216,12 +251,14 @@ def _save_pdf(path: Path, text: str, title: str = "Resposta") -> None:
 
 
 def _resolve_hf_selection_to_path(root: Path, selection: str) -> Optional[Path]:
-    """
-    Se a seleção apontar para um .gguf, tenta resolver para um caminho real.
-    Aceita:
-    - caminho absoluto para .gguf
-    - caminho relativo dentro de root
-    - apenas nome do arquivo (procura recursivamente)
+    """Resolve a GUI GGUF selection string to an existing file path.
+
+    Args:
+        root: HF/LLM root used for relative lookup.
+        selection: Absolute path, path under ``root``, or ``*.gguf`` basename.
+
+    Returns:
+        Path to the file if found; otherwise ``None``.
     """
     s = (selection or "").strip()
     if not s:
@@ -243,6 +280,13 @@ def _resolve_hf_selection_to_path(root: Path, selection: str) -> Optional[Path]:
 
 
 class AskWorker(QThread):
+    """Background worker that runs RAG and emits answer text plus source metadata.
+
+    Signals:
+        done: Emitted with ``(answer_text, sources_list)`` on success.
+        failed: Emitted with error message string on failure.
+    """
+
     done = Signal(str, list)
     failed = Signal(str)
 
@@ -260,6 +304,21 @@ class AskWorker(QThread):
         api_cfg: Optional[ApiConfig],
         top_k: int,
     ) -> None:
+        """Store parameters for :meth:`run`.
+
+        Args:
+            question: User question text.
+            system_prompt: Extra instructions merged into the RAG prompt.
+            provider: One of ``ollama``, ``hf``, ``api``.
+            ollama_model: Ollama model name when provider is Ollama.
+            ollama_base_url: Ollama API URL.
+            hf_model: HF repo id, relative path, or GGUF selection for HF tab.
+            hf_cache_dir: HF cache / LLM root directory.
+            hf_device: Torch device index for HF transformers pipeline.
+            hf_max_new_tokens: Max new tokens for HF / GGUF generation.
+            api_cfg: API keys and model when provider is ``api``; else ``None``.
+            top_k: Retrieval ``k`` override for this request.
+        """
         super().__init__()
         self.question = question
         self.system_prompt = system_prompt
@@ -274,6 +333,14 @@ class AskWorker(QThread):
         self.top_k = top_k
 
     def _build_llm_runtime(self):
+        """Create the LangChain LLM for the current ``provider``.
+
+        Returns:
+            Chat model or pipeline suitable for ``answer_with_sources``.
+
+        Raises:
+            ValueError: Missing API config or unknown provider.
+        """
         provider = (self.provider or "").lower().strip()
         if provider == "ollama":
             from langchain_ollama import ChatOllama
@@ -335,6 +402,11 @@ class AskWorker(QThread):
         raise ValueError("Provider inválido. Use ollama/hf/api.")
 
     def run(self) -> None:
+        """Invoke RAG, then emit ``done`` or ``failed``.
+
+        Returns:
+            None (communicates via signals).
+        """
         try:
             # override temporário para top_k
             settings = get_settings()
@@ -365,14 +437,31 @@ class AskWorker(QThread):
 
 
 class IngestWorker(QThread):
+    """Background worker that loads files from disk and rebuilds the Chroma index.
+
+    Signals:
+        done: Human-readable summary string on success.
+        failed: Error message on exception.
+    """
+
     done = Signal(str)
     failed = Signal(str)
 
     def __init__(self, docs_dir: str) -> None:
+        """Initialize with the documents directory to index.
+
+        Args:
+            docs_dir: Directory path containing documents to index.
+        """
         super().__init__()
         self.docs_dir = docs_dir
 
     def run(self) -> None:
+        """Load, index, and emit status; on error emit ``failed``.
+
+        Returns:
+            None
+        """
         try:
             s = get_settings()
             docs_path = Path(self.docs_dir)
@@ -422,7 +511,14 @@ class ChatPane:
 
 
 class MainWindow(QMainWindow):
+    """Main application window (LLM tabs, RAG settings, ingest, session log)."""
+
     def __init__(self) -> None:
+        """Build UI, restore ``QSettings``, and refresh model lists.
+
+        Returns:
+            None
+        """
         super().__init__()
         self.setWindowTitle("RAG Local — perguntas com seus documentos")
         self.resize(1100, 700)
@@ -442,6 +538,11 @@ class MainWindow(QMainWindow):
         self._refresh_models()
 
     def _build_ui(self) -> None:
+        """Lay out toolbars, provider tabs, RAG controls, ingest, and session widgets.
+
+        Returns:
+            None
+        """
         toolbar = QToolBar("Main")
         self.addToolBar(toolbar)
         act_refresh = QAction("Atualizar lista de modelos", self)
@@ -667,6 +768,14 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(left, 1)
 
     def _build_chat_block(self, provider_key: str) -> QWidget:
+        """Create chat UI for one provider key and register handlers.
+
+        Args:
+            provider_key: ``ollama``, ``hf``, or ``api``.
+
+        Returns:
+            Group box widget containing the chat layout.
+        """
         gb = QGroupBox("Chat")
         outer = QVBoxLayout(gb)
 
@@ -754,6 +863,11 @@ class MainWindow(QMainWindow):
         return gb
 
     def _load_state(self) -> None:
+        """Restore widget values from stored settings and ``get_settings`` defaults.
+
+        Returns:
+            None
+        """
         s = get_settings()
         tab = self.settings.value("provider_tab", "Ollama")
         tab_map = {"ollama": "Ollama", "hf": "Hugging Face", "api": "API"}
@@ -786,6 +900,11 @@ class MainWindow(QMainWindow):
         self._refresh_history_lists()
 
     def _save_state(self) -> None:
+        """Write current UI values to ``QSettings``.
+
+        Returns:
+            None
+        """
         self.settings.setValue("provider_tab", self.tabs.tabText(self.tabs.currentIndex()))
         self.settings.setValue("ollama_url", self.le_ollama_url.text().strip())
         self.settings.setValue("hf_cache", self.le_hf_cache.text().strip())
@@ -804,6 +923,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("hf_simple", "true" if self.chk_hf_simple.isChecked() else "false")
 
     def _wipe_all_qa_data(self) -> None:
+        """Clear session log and per-provider chat history (in-memory only).
+
+        Returns:
+            None
+        """
         self.session_log.clear()
         for k in self.chat_history:
             self.chat_history[k] = []
@@ -813,6 +937,14 @@ class MainWindow(QMainWindow):
             self.te_session_detail.clear()
 
     def closeEvent(self, event):  # noqa: N802
+        """Save settings, wipe QA buffers, and delegate to ``QMainWindow.closeEvent``.
+
+        Args:
+            event: Qt close event.
+
+        Returns:
+            None
+        """
         self._wipe_all_qa_data()
         self._save_state()
         try:
@@ -822,6 +954,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _refresh_embed_info(self) -> None:
+        """Refresh embedding model label and Chroma path label from ``get_settings``.
+
+        Returns:
+            None
+        """
         s = get_settings()
         self.lbl_embed_model.setText(
             f"{s.embed_provider} → {s.embed_model}\n"
@@ -833,17 +970,32 @@ class MainWindow(QMainWindow):
             self.lbl_chroma_path.setText(str(s.chroma_dir))
 
     def _pick_hf_dir(self) -> None:
+        """Choose HF/LLM root via dialog and refresh HF models.
+
+        Returns:
+            None
+        """
         d = QFileDialog.getExistingDirectory(self, "Selecione a pasta de modelos/cache HF")
         if d:
             self.le_hf_cache.setText(d)
             self._refresh_models()
 
     def _pick_docs_dir(self) -> None:
+        """Choose documents folder for ingestion via dialog.
+
+        Returns:
+            None
+        """
         d = QFileDialog.getExistingDirectory(self, "Selecione a pasta docs (PDF/TXT/MD)")
         if d:
             self.le_docs_dir.setText(d)
 
     def _refresh_history_lists(self) -> None:
+        """Rebuild list widgets from ``chat_history`` for each ``ChatPane``.
+
+        Returns:
+            None
+        """
         for key, pane in self.chat_panes.items():
             pane.lst_history.blockSignals(True)
             pane.lst_history.clear()
@@ -855,6 +1007,14 @@ class MainWindow(QMainWindow):
             pane.lst_history.blockSignals(False)
 
     def _clear_history(self, provider_key: str) -> None:
+        """Clear history for one provider and reset its text widgets.
+
+        Args:
+            provider_key: ``ollama``, ``hf``, or ``api``.
+
+        Returns:
+            None
+        """
         self.session_log = [r for r in self.session_log if r.provider != provider_key]
         self._refresh_session_list()
         if not self.session_log and hasattr(self, "te_session_detail"):
@@ -867,6 +1027,11 @@ class MainWindow(QMainWindow):
         pane.te_sources.clear()
 
     def _refresh_session_list(self) -> None:
+        """Rebuild ``lst_session`` from ``session_log``.
+
+        Returns:
+            None
+        """
         if not hasattr(self, "lst_session"):
             return
         self.lst_session.blockSignals(True)
@@ -879,6 +1044,14 @@ class MainWindow(QMainWindow):
         self.lst_session.blockSignals(False)
 
     def _on_session_row(self, idx: int) -> None:
+        """Display session detail text for row ``idx``.
+
+        Args:
+            idx: Row index in ``lst_session``.
+
+        Returns:
+            None
+        """
         if idx < 0 or idx >= len(self.session_log):
             return
         row = self.session_log[idx]
@@ -891,6 +1064,15 @@ class MainWindow(QMainWindow):
         )
 
     def _load_history_item(self, provider_key: str, idx: int) -> None:
+        """Copy a stored ``ChatEntry`` into the pane editors.
+
+        Args:
+            provider_key: Provider whose history is shown.
+            idx: Index in ``chat_history[provider_key]``.
+
+        Returns:
+            None
+        """
         if idx < 0:
             return
         items = self.chat_history.get(provider_key, [])
@@ -903,6 +1085,11 @@ class MainWindow(QMainWindow):
         pane.te_sources.setPlainText(json.dumps(entry.sources, ensure_ascii=False, indent=2))
 
     def _refresh_models(self) -> None:
+        """Fill model combo boxes for the current provider tab.
+
+        Returns:
+            None
+        """
         provider = self.tabs.tabText(self.tabs.currentIndex()).lower()
         if provider.startswith("hugging"):
             provider = "hf"
@@ -961,6 +1148,11 @@ class MainWindow(QMainWindow):
             return
 
     def _start_ollama(self) -> None:
+        """Start ``ollama serve`` in a new console (Windows) and schedule model refresh.
+
+        Returns:
+            None
+        """
         # Abre uma janela separada do Prompt executando o `ollama serve`.
         # Guardamos o PID para permitir "Parar" via taskkill.
         try:
@@ -1003,6 +1195,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ollama", f"Falha ao iniciar `ollama serve`: {e}")
 
     def _stop_ollama(self) -> None:
+        """Kill the process started by :meth:`_start_ollama` via ``taskkill`` on Windows.
+
+        Returns:
+            None
+        """
         pid = getattr(self, "ollama_serve_pid", None)
         if not pid:
             QMessageBox.information(self, "Ollama", "Nenhum `ollama serve` iniciado pela GUI.")
@@ -1016,6 +1213,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ollama", f"Falha ao parar: {e}")
 
     def _api_cfg(self) -> Optional[ApiConfig]:
+        """Build API configuration if the API tab is active and a model is set.
+
+        Returns:
+            ``ApiConfig`` or ``None`` when not on API tab or model empty.
+        """
         provider = self.tabs.tabText(self.tabs.currentIndex()).lower()
         if not provider.startswith("api"):
             return None
@@ -1032,6 +1234,14 @@ class MainWindow(QMainWindow):
         )
 
     def _ask(self, provider: str) -> None:
+        """Validate inputs and start :class:`AskWorker` for the active pane.
+
+        Args:
+            provider: ``ollama``, ``hf``, or ``api``.
+
+        Returns:
+            None
+        """
         self._save_state()
         provider = (provider or "").lower().strip()
 
@@ -1075,6 +1285,11 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _ingest(self) -> None:
+        """Start :class:`IngestWorker` for the configured documents directory.
+
+        Returns:
+            None
+        """
         self._save_state()
         docs_dir = self.le_docs_dir.text().strip() or "docs"
         self.btn_ingest.setEnabled(False)
@@ -1086,15 +1301,40 @@ class MainWindow(QMainWindow):
         self.ingest_worker.start()
 
     def _on_ingest_done(self, msg: str) -> None:
+        """Re-enable ingest button and show completion message.
+
+        Args:
+            msg: Status text from the worker.
+
+        Returns:
+            None
+        """
         self.btn_ingest.setEnabled(True)
         self.lbl_ingest_status.setText(msg)
 
     def _on_ingest_fail(self, msg: str) -> None:
+        """Show ingest error and reset status label.
+
+        Args:
+            msg: Exception message.
+
+        Returns:
+            None
+        """
         self.btn_ingest.setEnabled(True)
         self.lbl_ingest_status.setText("")
         QMessageBox.critical(self, "Indexação", msg)
 
     def _on_answer(self, text: str, sources: list) -> None:
+        """Fill answer/sources widgets and append history rows.
+
+        Args:
+            text: Model answer.
+            sources: Serialized source metadata list.
+
+        Returns:
+            None
+        """
         provider = self._pending_provider_for_answer or "ollama"
         pane = self.chat_panes.get(provider)
         if pane:
@@ -1121,6 +1361,14 @@ class MainWindow(QMainWindow):
         self._pending_provider_for_answer = None
 
     def _on_fail(self, msg: str) -> None:
+        """Show error dialog and re-enable the ask button.
+
+        Args:
+            msg: Error message from :class:`AskWorker`.
+
+        Returns:
+            None
+        """
         provider = self._pending_provider_for_answer or "ollama"
         pane = self.chat_panes.get(provider)
         if pane:
@@ -1130,6 +1378,15 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Erro", msg)
 
     def _save_response(self, provider: str, kind: str) -> None:
+        """Save the current answer as TXT or PDF.
+
+        Args:
+            provider: Provider key for the pane.
+            kind: ``txt`` or ``pdf``.
+
+        Returns:
+            None
+        """
         pane = self.chat_panes[provider]
         text = pane.te_answer.toPlainText().strip()
         if not text:
@@ -1154,6 +1411,11 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    """Run the Qt application event loop.
+
+    Returns:
+        Does not return; calls ``sys.exit`` with the app exec code.
+    """
     _configure_logging()
     app = QApplication(sys.argv)
     w = MainWindow()
